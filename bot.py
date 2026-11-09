@@ -7,7 +7,7 @@ Features:
     24-hour lifetime, new-test alerts, practice attempts, review after the test ends
   * Ranks (10 levels), Daily / Weekly / Overall rankings
   * Announcements (to the group or to one student) with Preview + Publish
-  * Group: ONE combined daily digest (tests ended, new ranks, top 10), /rank /daily /weekly
+  * Rankings as a leaderboard picture (Today / Week / Overall); group: /rankings, daily digest
   * Creator panel: settings, users, roles, all tests, statistics, rankings, security,
     backup & restore, notifications
   * Safety: automatic backup pinned in the Creator's chat, restored by itself on a fresh server
@@ -44,12 +44,14 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
     BotCommandScopeAllGroupChats,
+    BufferedInputFile,
     CallbackQuery,
     ErrorEvent,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaDocument,
+    InputMediaPhoto,
     Message,
     TelegramObject,
 )
@@ -559,27 +561,6 @@ def ranking_rows(kind: str):
     return rows, totals
 
 
-RANKING_TITLES = {"daily": "📅 DAILY RANKINGS", "weekly": "📆 WEEKLY RANKINGS", "overall": "🏆 OVERALL RANKINGS"}
-
-
-def ranking_text(kind: str, viewer=None, limit: int = 10) -> str:
-    rows, totals = ranking_rows(kind)
-    lines = [f"<b>{RANKING_TITLES[kind]}</b>", LINE]
-    if not rows:
-        lines.append("No results have been recorded yet.")
-    for i, r in enumerate(rows[:limit], 1):
-        mark = MEDALS.get(i, f"{i}.")
-        lines.append(
-            f"{mark} <b>{escape(r['full_name'] or '-')}</b> · "
-            f"{escape(rank_for(totals.get(r['tg_id'], 0)))} · {r['pts']} pts"
-        )
-    if viewer:
-        for i, r in enumerate(rows, 1):
-            if r["tg_id"] == viewer and i > limit:
-                lines += ["", f"<b>Your position:</b> #{i} · {r['pts']} pts"]
-    return "\n".join(lines)
-
-
 # ============================================================================
 # Tests: creation, attempts, results
 # ============================================================================
@@ -1016,15 +997,6 @@ def staff_menu(role: str) -> InlineKeyboardMarkup:
     )
 
 
-def rankings_menu() -> InlineKeyboardMarkup:
-    return kb(
-        [btn("📅 Daily Rankings", "rk:daily")],
-        [btn("📆 Weekly Rankings", "rk:weekly")],
-        [btn("🏆 Overall Rankings", "rk:overall")],
-        MAIN,
-    )
-
-
 # ============================================================================
 # FSM states
 # ============================================================================
@@ -1174,16 +1146,221 @@ async def cb_profile(call: CallbackQuery) -> None:
     await show(call, profile_card(call.from_user.id, call.from_user.full_name), kb(MAIN))
 
 
+# ============================================================================
+# Leaderboard (the rankings as a picture)
+# ============================================================================
+
+LB_TITLES = {"daily": "DAILY", "weekly": "WEEKLY", "overall": "OVERALL"}
+ASSET_DIR = os.path.dirname(os.path.abspath(__file__))  # logo.jpg and the .ttf fonts live next to bot.py
+LAST_LEADERBOARD: dict = {}    # chat id -> id of the newest leaderboard message (the old one is deleted)
+GROUP_COOLDOWN: dict = {}      # group chat id -> time of the last /rankings answer
+_ASSETS: dict = {}
+
+
+def fmt_points(value) -> str:
+    """4206 -> '4.206'"""
+    return f"{int(value):,}".replace(",", ".")
+
+
+def load_font(name: str, size: int):
+    from PIL import ImageFont
+    try:
+        return ImageFont.truetype(os.path.join(ASSET_DIR, name), size)
+    except OSError:
+        logging.warning("Font %s was not found next to bot.py: using the default font.", name)
+        try:
+            return ImageFont.load_default(size)
+        except TypeError:
+            return ImageFont.load_default()
+
+
+def logo_badge(size: int):
+    """The academy logo as a rounded badge (None if logo.jpg is missing)."""
+    if size in _ASSETS:
+        return _ASSETS[size]
+    from PIL import Image, ImageDraw
+    resample = getattr(Image, "Resampling", Image).LANCZOS
+    try:
+        logo = Image.open(os.path.join(ASSET_DIR, "logo.jpg")).convert("RGB").resize((size, size), resample)
+    except OSError:
+        logging.warning("logo.jpg was not found next to bot.py: the leaderboard is drawn without a logo.")
+        _ASSETS[size] = None
+        return None
+    scale = 4
+    radius = int(size * scale * 0.16)
+    mask = Image.new("L", (size * scale, size * scale), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, size * scale - 1, size * scale - 1), radius=radius, fill=255)
+    out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    out.paste(logo, (0, 0), mask.resize((size, size), resample))
+    ring = Image.new("RGBA", (size * scale, size * scale), (0, 0, 0, 0))
+    ImageDraw.Draw(ring).rounded_rectangle((2, 2, size * scale - 3, size * scale - 3), radius=radius,
+                                           outline=(190, 146, 52), width=max(3, size // 36) * scale)
+    out.alpha_composite(ring.resize((size, size), resample))
+    _ASSETS[size] = out
+    return out
+
+
+def render_leaderboard_png(title: str, entries: list) -> bytes:
+    """Draws the leaderboard. entries: [(name, rank title, points), ...] (at most 10). Needs Pillow."""
+    import io
+    from PIL import Image, ImageDraw
+    W, H = 1280, 720
+    navy, navy_dark = (18, 48, 107), (10, 28, 68)
+    gold, silver, bronze = (190, 146, 52), (176, 184, 196), (176, 112, 66)
+    cream, panel_fill, sub_col = (243, 237, 224), (251, 248, 241), (110, 100, 80)
+
+    img = Image.new("RGB", (W, H), cream)
+    deco = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ring = (*gold, 40)
+    ImageDraw.Draw(deco).ellipse((-140, -150, 160, 150), outline=ring, width=34)
+    ImageDraw.Draw(deco).ellipse((W - 210, H - 230, W + 130, H + 110), outline=ring, width=30)
+    img.paste(deco, (0, 0), deco)
+    d = ImageDraw.Draw(img)
+
+    title_font = load_font("DejaVuSerif-Bold.ttf", 54)
+    d.text((W / 2, 62), title, font=title_font, fill=navy, anchor="mm")
+    d.line((W / 2 - 115, 102, W / 2 + 115, 102), fill=gold, width=3)
+    d.ellipse((W / 2 - 5, 97, W / 2 + 5, 107), fill=gold)
+
+    px0, py0, px1, py1 = 40, 124, W - 40, H - 28
+    d.rounded_rectangle((px0, py0, px1, py1), radius=26, fill=panel_fill, outline=gold, width=3)
+
+    name_font = load_font("DejaVuSans-Bold.ttf", 21)
+    sub_font = load_font("DejaVuSans.ttf", 13)
+    num_font = load_font("DejaVuSans-Bold.ttf", 16)
+    if not entries:
+        d.text((W / 2, (py0 + py1) / 2), "No results yet", font=load_font("DejaVuSerif-Bold.ttf", 36),
+               fill=sub_col, anchor="mm")
+    x_num, x_name, x_bar = 74, 112, 372
+    max_bar = (W - 70) - x_bar
+    top = max((e[2] for e in entries), default=1) or 1
+    y, row_h, gap = py0 + 20, 44, 7
+    for i, (name, rank, pts) in enumerate(entries[:10]):
+        cy = y + row_h / 2
+        color = (gold, silver, bronze)[i] if i < 3 else navy
+        d.ellipse((x_num - 16, cy - 16, x_num + 16, cy + 16), fill=color)
+        d.text((x_num, cy), str(i + 1), font=num_font, fill=navy_dark if i < 3 else (255, 255, 255), anchor="mm")
+        limit = x_bar - x_name - 18
+        while name and d.textlength(name, font=name_font) > limit:
+            name = name[:-1]
+        shown = name if name == entries[i][0] else name.rstrip() + "…"
+        d.text((x_name, cy - 11), shown, font=name_font, fill=navy_dark, anchor="lm")
+        d.text((x_name, cy + 13), rank, font=sub_font, fill=sub_col, anchor="lm")
+        bar_w = max(120, int(max_bar * pts / top))
+        d.rounded_rectangle((x_bar, y + 2, x_bar + bar_w, y + row_h - 2), radius=(row_h - 4) // 2, fill=color)
+        d.text((x_bar + bar_w / 2, cy), fmt_points(pts), font=name_font,
+               fill=navy_dark if i < 3 else (255, 255, 255), anchor="mm")
+        y += row_h + gap
+
+    badge = logo_badge(158)
+    if badge is not None:
+        img.paste(badge, (W - 70 - 158 + 10, H - 28 - 158 - 14), badge)
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
+
+
+def leaderboard_caption(kind: str, rows, viewer=None) -> str:
+    lines = [f"📈 <b>{LB_TITLES[kind]} LEADERBOARD</b>"]
+    if not rows:
+        lines.append("No results have been recorded yet.")
+    for i, r in enumerate(rows[:10], 1):
+        mark = MEDALS.get(i, f"{i}. 👤")
+        lines.append(f"{mark} {escape(clip(r['full_name'] or '-', 28))} • {fmt_points(r['pts'])}")
+    if viewer:
+        for i, r in enumerate(rows, 1):
+            if r["tg_id"] == viewer and i > 10:
+                lines += ["", f"👉 <b>Your position:</b> #{i} · {fmt_points(r['pts'])} pts"]
+    lines += ["", f"⭐ <b>Total points:</b> {fmt_points(sum(r['pts'] for r in rows))}"]
+    return "\n".join(lines)
+
+
+def leaderboard_markup(active: str) -> InlineKeyboardMarkup:
+    def label(kind: str, icon: str, text: str) -> str:
+        return f"✅ {text}" if kind == active else f"{icon} {text}"
+    return kb([btn(label("daily", "📅", "Today"), "lb:daily"), btn(label("weekly", "📆", "Week"), "lb:weekly")],
+              [btn(label("overall", "🏆", "Overall"), "lb:overall")])
+
+
+async def build_leaderboard(kind: str, viewer=None):
+    """Returns (picture or None, caption). If the picture cannot be drawn, only the caption is used."""
+    rows, totals = ranking_rows(kind)
+    caption = leaderboard_caption(kind, rows, viewer)
+    entries = [(r["full_name"] or "-", rank_for(totals.get(r["tg_id"], 0)), r["pts"]) for r in rows[:10]]
+    try:
+        png = await asyncio.to_thread(render_leaderboard_png, f"{LB_TITLES[kind]} LEADERBOARD", entries)
+        return BufferedInputFile(png, filename="leaderboard.png"), caption
+    except Exception:
+        logging.exception("Could not draw the leaderboard picture: sending the text list only")
+        return None, caption
+
+
+async def send_leaderboard(bot: Bot, chat_id: int, kind: str, viewer=None, buttons: bool = True,
+                           track: bool = True) -> None:
+    """Sends the leaderboard as a new message. With track=True the previous one in that chat is deleted."""
+    photo, caption = await build_leaderboard(kind, viewer)
+    markup = leaderboard_markup(kind) if buttons else None
+    if photo is not None:
+        sent = await bot.send_photo(chat_id, photo, caption=caption, reply_markup=markup)
+    else:
+        sent = await bot.send_message(chat_id, caption, reply_markup=markup)
+    if track:
+        old = LAST_LEADERBOARD.get(chat_id)
+        LAST_LEADERBOARD[chat_id] = sent.message_id
+        if old:
+            try:
+                await bot.delete_message(chat_id, old)
+            except TelegramAPIError:
+                pass
+
+
 @router.callback_query(F.data.in_({"st:rankings", "panel:rankings", "rk:menu"}), HasRole(*ANY_ROLE))
-async def cb_rankings_menu(call: CallbackQuery) -> None:
-    await show(call, f"{title_block('🏆 RANKINGS')}Please select a ranking category.", rankings_menu())
+async def cb_rankings_open(call: CallbackQuery) -> None:
+    await call.answer()
+    await send_leaderboard(call.bot, call.from_user.id, "overall", call.from_user.id)
 
 
 @router.callback_query(F.data.in_({"rk:daily", "rk:weekly", "rk:overall"}), HasRole(*ANY_ROLE))
-async def cb_rank_view(call: CallbackQuery) -> None:
+async def cb_rank_open_kind(call: CallbackQuery) -> None:
+    await call.answer()
+    await send_leaderboard(call.bot, call.from_user.id, call.data.split(":")[1], call.from_user.id)
+
+
+@router.callback_query(F.data.startswith("lb:"))
+async def cb_leaderboard_switch(call: CallbackQuery) -> None:
+    """Today / Week / Overall buttons under a leaderboard (in private chats and in the group)."""
     kind = call.data.split(":")[1]
-    text = ranking_text(kind, viewer=call.from_user.id)
-    await show(call, text, kb([btn("◀️ Back to Rankings", "rk:menu")], MAIN))
+    msg = call.message
+    if kind not in LB_TITLES or not isinstance(msg, Message):
+        await call.answer()
+        return
+    if msg.chat.type == "private":
+        if get_role(call.from_user.id) not in ANY_ROLE:
+            await call.answer("Access denied.", show_alert=True)
+            return
+        viewer = call.from_user.id
+    else:
+        if msg.chat.id != get_group_id():
+            await call.answer()
+            return
+        viewer = None
+    photo, caption = await build_leaderboard(kind, viewer)
+    markup = leaderboard_markup(kind)
+    try:
+        if msg.photo and photo is not None:
+            await call.bot.edit_message_media(
+                InputMediaPhoto(media=photo, caption=caption, parse_mode="HTML"),
+                chat_id=msg.chat.id, message_id=msg.message_id, reply_markup=markup)
+        elif msg.photo:
+            await call.bot.edit_message_caption(chat_id=msg.chat.id, message_id=msg.message_id,
+                                                caption=caption, reply_markup=markup)
+        else:
+            await call.bot.edit_message_text(caption, chat_id=msg.chat.id, message_id=msg.message_id,
+                                             reply_markup=markup)
+    except TelegramBadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            raise
+    await call.answer()
 
 
 # ============================================================================
@@ -1798,20 +1975,21 @@ def can_manage(role: str, user_id: int, test) -> bool:
     return bool(test) and test["status"] != "deleted" and (role == "creator" or test["created_by"] == user_id)
 
 
-STATUS_ICON = {"published": "🟢", "closed": "🔴", "expired": "⌛"}
-STATUS_NAME = {"published": "Published", "closed": "Closed", "expired": "Expired"}
+STATUS_ICON = {"published": "🟢", "closed": "🔴", "expired": "🔴"}
+STATUS_NAME = {"published": "Published", "closed": "Closed", "expired": "Closed (time ended)"}
 
 
 async def show_manage_list(call: CallbackQuery, page: int) -> None:
     role = get_role(call.from_user.id)
     owner = None if role == "creator" else call.from_user.id
-    rows, total = tests_page(page, owner)
+    rows, total = tests_page(page, owner, include_expired=True)
     title = "📋 MANAGE ALL TESTS" if role == "creator" else "📋 MANAGE TESTS"
     text = title_block(title)
     text += ("Select a test to manage." if rows else
-             "No active tests." + ("" if role == "creator" else " Tests you publish will appear here."))
+             "No tests yet." + ("" if role == "creator" else " Tests you publish will appear here."))
     buttons = [[btn(f"{STATUS_ICON.get(r['status'], '•')} {clip(r['title'], 22)} · {r['qn']}Q · "
-                    f"{time_left(r['expires_at'])}", f"mtv:{r['id']}")] for r in rows]
+                    f"{'ended' if r['status'] == 'expired' else time_left(r['expires_at'])}", f"mtv:{r['id']}")]
+               for r in rows]
     top = [[btn("➕ Create Test", "cr:create_test")]] if role == "creator" else []
     await show(call, text, kb(*top, *buttons, nav_row("mt:", page, total, PAGE), MAIN))
 
@@ -1842,15 +2020,16 @@ async def show_test_details(call: CallbackQuery, test_id: int) -> None:
              f"<b>Questions:</b> {count_questions(test_id)}",
              f"<b>Time limit:</b> {fmt_duration(test_seconds(test_id))}",
              f"<b>Completed attempts:</b> {attempts}",
-             f"<b>Available for:</b> {time_left(test['expires_at'])}",
+             f"<b>Available for:</b> {'ended' if test['status'] == 'expired' else time_left(test['expires_at'])}",
              f"<b>Created:</b> {local_time(test['created_at'])}"]
     if role == "creator":
         who = owner["name"] if owner and owner["name"] else str(test["created_by"])
         lines.append(f"<b>Created by:</b> {escape(who)}")
     toggle = (btn("🔒 Close Test", f"mtc:{test_id}") if test["status"] == "published"
               else btn("🔓 Reopen Test", f"mtc:{test_id}"))
-    markup = kb([toggle, btn("🗑 Delete Test", f"mtd:{test_id}")],
-                [btn("📊 Results", f"trv:{test_id}")], [btn("◀️ Back", "mt:0")], MAIN)
+    first_row = ([btn("🗑 Delete Test", f"mtd:{test_id}")] if test["status"] == "expired"
+                 else [toggle, btn("🗑 Delete Test", f"mtd:{test_id}")])  # a test whose time ended cannot reopen
+    markup = kb(first_row, [btn("📊 Results", f"trv:{test_id}")], [btn("◀️ Back", "mt:0")], MAIN)
     await show(call, "\n".join(lines), markup)
 
 
@@ -1867,7 +2046,7 @@ async def cb_test_toggle(call: CallbackQuery) -> None:
         await call.answer("Access denied. You can manage only your own tests.", show_alert=True)
         return
     if test["status"] not in ("published", "closed"):
-        await call.answer("This test has expired.", show_alert=True)
+        await call.answer("The time of this test has ended, so it cannot be reopened.", show_alert=True)
         return
     new_status = "closed" if test["status"] == "published" else "published"
     with db() as c:
@@ -2364,20 +2543,27 @@ async def points_adjust_value(message: Message, state: FSMContext) -> None:
     if current + delta < 0:
         await message.answer(f"⚠️ The student has only {current} points, so {-delta} cannot be subtracted.")
         return
-    reason = "manual: " + (m.group(2) or "adjustment")
+    reason_text = (m.group(2) or "").strip()
     with db() as c:
         c.execute("INSERT INTO points_history (user_id, points, reason, created_at) VALUES (?, ?, ?, ?)",
-                  (target, delta, reason, now()))
+                  (target, delta, "manual: " + (reason_text or "adjustment"), now()))
     log_activity(message.from_user.id, "points_adjusted", f"{target}: {delta:+d}")
     await state.clear()
     user = get_user(target)
     after = total_points(target)
+    old_rank, new_rank = rank_for(current), rank_for(after)
+    ranked_up = delta > 0 and new_rank != old_rank
+    if ranked_up:
+        log_activity(target, "promotion", new_rank)  # appears in the group's daily digest
+    notified = await notify_points_change(message.bot, target, delta, reason_text, after, new_rank, ranked_up)
+    status = ("✅ Student notified." if notified
+              else "⚠️ The student could not be notified (the bot is blocked or the chat is closed).")
     await message.answer(
         f"{title_block('✅ POINTS UPDATED')}"
         f"<b>Student:</b> {escape(user['full_name'])}\n"
         f"<b>Change:</b> {delta:+d}\n"
         f"<b>Total points:</b> {after}\n"
-        f"<b>Rank:</b> {escape(rank_for(after))}",
+        f"<b>Rank:</b> {escape(new_rank)}\n\n{status}",
         reply_markup=kb([btn("◀️ Back", "cr:rankings")], MAIN))
 
 
@@ -2810,27 +2996,34 @@ async def g_setgroup(message: Message) -> None:
     log_activity(message.from_user.id, "group_connected", str(message.chat.id))
     await message.answer(
         f"{title_block('✅ GROUP CONNECTED')}"
-        "This group is now connected. The bot will post test results, promotions and "
-        "daily and weekly rankings here.\n\n"
-        "Commands: /rank, /daily, /weekly")
+        "This group is now connected. Every day the bot posts the leaderboard, the tests that ended "
+        "and the new ranks here.\n\n"
+        "Commands: /rankings, /daily, /weekly")
 
 
-@group_router.message(Command("rank"))
-async def g_rank(message: Message) -> None:
-    if is_connected_group(message):
-        await message.answer(ranking_text("overall"))
+async def group_leaderboard(message: Message, kind: str) -> None:
+    """/rankings /daily /weekly in the connected group: one leaderboard picture, 30 s cooldown."""
+    if not is_connected_group(message):
+        return
+    if time.time() - GROUP_COOLDOWN.get(message.chat.id, 0) < 30:
+        return
+    GROUP_COOLDOWN[message.chat.id] = time.time()
+    await send_leaderboard(message.bot, message.chat.id, kind)
+
+
+@group_router.message(Command("rankings", "rank"))
+async def g_rankings(message: Message) -> None:
+    await group_leaderboard(message, "overall")
 
 
 @group_router.message(Command("daily"))
 async def g_daily(message: Message) -> None:
-    if is_connected_group(message):
-        await message.answer(ranking_text("daily"))
+    await group_leaderboard(message, "daily")
 
 
 @group_router.message(Command("weekly"))
 async def g_weekly(message: Message) -> None:
-    if is_connected_group(message):
-        await message.answer(ranking_text("weekly"))
+    await group_leaderboard(message, "weekly")
 
 
 @router.message(Command("setgroup"))
@@ -2839,15 +3032,7 @@ async def private_setgroup(message: Message) -> None:
                          "and only the Creator can use it.")
 
 
-def rank_lines(rows, totals, limit: int = 10) -> list:
-    lines = []
-    for i, r in enumerate(rows[:limit], 1):
-        lines.append(f"{MEDALS.get(i, f'{i}.')} <b>{escape(r['full_name'] or '-')}</b> · "
-                     f"{escape(rank_for(totals.get(r['tg_id'], 0)))} · {r['pts']} pts")
-    return lines
-
-
-def render_digest(ended, promos, daily_rows, weekly_rows, totals, per_test: int, max_tests: int) -> str:
+def render_digest(ended, promos, per_test: int, max_tests: int) -> str:
     lines = ["<b>📊 DAILY DIGEST</b>", LINE, f"📅 {datetime.now(TZ).strftime('%Y-%m-%d')}"]
     if ended:
         lines += ["", "<b>📝 TESTS ENDED</b>"]
@@ -2866,56 +3051,56 @@ def render_digest(ended, promos, daily_rows, weekly_rows, totals, per_test: int,
         lines += [f"• {escape(name)} → <b>{escape(rank)}</b>" for name, rank in promos[:12]]
         if len(promos) > 12:
             lines.append(f"…and {len(promos) - 12} more")
-    if daily_rows:
-        lines += ["", "<b>📅 TODAY'S TOP 10</b>"] + rank_lines(daily_rows, totals)
-    if weekly_rows:
-        lines += ["", "<b>📆 WEEKLY TOP 10</b>"] + rank_lines(weekly_rows, totals)
     return "\n".join(lines)
 
 
-def build_digest(since: str, include_weekly: bool):
-    """Everything for the group in ONE message: tests that ended, new ranks, daily (and weekly) top 10.
-    Returns None when there is nothing to report."""
-    daily_rows, totals = ranking_rows("daily")
-    weekly_rows = ranking_rows("weekly")[0] if include_weekly else []
-    ended, promos = [], []
-    if get_setting("post_results") == "1":
-        with db() as c:
-            test_ids = [int(r["details"].split(":")[0]) for r in c.execute(
-                "SELECT details FROM activity_logs WHERE action = 'test_expired' AND created_at >= ? ORDER BY id",
-                (since,))]
-            latest = {}
-            for r in c.execute(
-                    "SELECT u.full_name AS name, l.details AS rank FROM activity_logs l "
-                    "JOIN users u ON u.tg_id = l.user_id "
-                    "WHERE l.action = 'promotion' AND l.created_at >= ? ORDER BY l.id", (since,)):
-                latest[r["name"]] = r["rank"]
-        promos = list(latest.items())
-        for test_id in test_ids:
-            test = get_test(test_id)
-            summary = test_summary(test_id) if test else None
-            if summary and summary["participants"]:
-                ended.append((test, summary))
-    if not (daily_rows or weekly_rows or ended or promos):
+def build_digest(since: str):
+    """The text part of the daily digest: tests that ended and new ranks since the last digest.
+    Returns None when there is nothing to report (or 'Group results' is switched off)."""
+    if get_setting("post_results") != "1":
+        return None
+    ended, latest = [], {}
+    with db() as c:
+        test_ids = [int(r["details"].split(":")[0]) for r in c.execute(
+            "SELECT details FROM activity_logs WHERE action = 'test_expired' AND created_at >= ? ORDER BY id",
+            (since,))]
+        for r in c.execute(
+                "SELECT u.full_name AS name, l.details AS rank FROM activity_logs l "
+                "JOIN users u ON u.tg_id = l.user_id "
+                "WHERE l.action = 'promotion' AND l.created_at >= ? ORDER BY l.id", (since,)):
+            latest[r["name"]] = r["rank"]
+    for test_id in test_ids:
+        test = get_test(test_id)
+        summary = test_summary(test_id) if test else None
+        if summary and summary["participants"]:
+            ended.append((test, summary))
+    promos = list(latest.items())
+    if not (ended or promos):
         return None
     text = ""
     for per_test, max_tests in ((5, 5), (3, 3), (1, 2)):  # shrink until it fits one Telegram message
-        text = render_digest(ended, promos, daily_rows, weekly_rows, totals, per_test, max_tests)
+        text = render_digest(ended, promos, per_test, max_tests)
         if len(text) <= 3900:
             return text
     return text[:3900].rsplit("\n", 1)[0] + "\n…"
 
 
 async def send_digest(bot: Bot, gid: int, include_weekly: bool) -> None:
+    """Daily group report: today's leaderboard picture (and the weekly one on Sundays),
+    then one text message with the tests that ended and the new ranks."""
     since = get_setting("last_digest_at") or (
         datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
-    text = build_digest(since, include_weekly)
-    if text:
-        try:
+    try:
+        if ranking_rows("daily")[0]:
+            await send_leaderboard(bot, gid, "daily", buttons=False, track=False)
+        if include_weekly and ranking_rows("weekly")[0]:
+            await send_leaderboard(bot, gid, "weekly", buttons=False, track=False)
+        text = build_digest(since)
+        if text:
             await bot.send_message(gid, text)
-        except TelegramAPIError as exc:
-            logging.warning("Could not post the digest to the group: %s", exc)
-            return  # keep the events for the next try
+    except TelegramAPIError as exc:
+        logging.warning("Could not post the digest to the group: %s", exc)
+        return  # keep the events for the next try
     set_setting("last_digest_at", now())
 
 
@@ -3055,6 +3240,23 @@ def spawn(coro) -> None:
     task.add_done_callback(BACKGROUND_TASKS.discard)
 
 
+async def notify_points_change(bot: Bot, target: int, delta: int, reason: str, total: int,
+                               rank: str, ranked_up: bool) -> bool:
+    """Tells a student that the Creator added or removed points. Returns False if the message did not arrive."""
+    title = "🎁 POINTS ADDED" if delta > 0 else "📉 POINTS DEDUCTED"
+    lines = [title_block(title).rstrip(), f"<b>Change:</b> {delta:+d}"]
+    if reason:
+        lines.append(f"<b>Reason:</b> {escape(reason)}")
+    lines += [f"<b>Total points:</b> {total}", f"<b>Rank:</b> {escape(rank)}"]
+    if ranked_up:
+        lines += ["", f"🎉 <b>New rank reached: {escape(rank)}</b>"]
+    try:
+        await bot.send_message(target, "\n".join(lines))
+        return True
+    except TelegramAPIError:
+        return False
+
+
 async def notify_creator(bot: Bot, text: str) -> None:
     try:
         await bot.send_message(CREATOR_ID, text)
@@ -3161,10 +3363,9 @@ async def cmd_my(message: Message) -> None:
     await message.answer(profile_card(message.from_user.id, message.from_user.full_name), reply_markup=kb(MAIN))
 
 
-@router.message(Command("rank"), HasRole(*ANY_ROLE))
+@router.message(Command("rank", "rankings"), HasRole(*ANY_ROLE))
 async def cmd_rank(message: Message) -> None:
-    await message.answer(ranking_text("overall", viewer=message.from_user.id),
-                         reply_markup=kb([btn("◀️ Back to Rankings", "rk:menu")], MAIN))
+    await send_leaderboard(message.bot, message.chat.id, "overall", message.from_user.id)
 
 
 # ============================================================================
@@ -3234,11 +3435,11 @@ async def main() -> None:
 
     await bot.set_my_commands([BotCommand(command="start", description="Open the main menu"),
                                BotCommand(command="my", description="My profile"),
-                               BotCommand(command="rank", description="Overall rankings")])
+                               BotCommand(command="rankings", description="Leaderboard")])
     await bot.set_my_commands(
-        [BotCommand(command="rank", description="Overall rankings"),
-         BotCommand(command="daily", description="Daily rankings"),
-         BotCommand(command="weekly", description="Weekly rankings"),
+        [BotCommand(command="rankings", description="Leaderboard"),
+         BotCommand(command="daily", description="Today's leaderboard"),
+         BotCommand(command="weekly", description="Weekly leaderboard"),
          BotCommand(command="setgroup", description="Connect this group (Creator only)")],
         scope=BotCommandScopeAllGroupChats(),
     )
