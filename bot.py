@@ -10,11 +10,13 @@ Features:
   * Rankings as a leaderboard picture (Today / Week / Overall); group: /rankings, daily digest
   * Creator panel: settings, users, roles, all tests, statistics, rankings, security,
     backup & restore, notifications
+  * Mandatory subscription: students must join the required channels (managed in Security & Access)
   * Safety: automatic backup pinned in the Creator's chat, restored by itself on a fresh server
 
 Run locally:   python bot.py          (needs a .env file next to this file)
 Environment:   BOT_TOKEN, CREATOR_ID (required), TEACHER_IDS, SUPPORTER_IDS (optional),
-               DB_PATH (optional), PORT (set by Render; opens a small health-check page)
+               DB_PATH (optional), PORT (set by Render; opens a small health-check page),
+               BUTTON_COLORS=0 (optional; switches the colored buttons off)
 """
 
 import asyncio
@@ -33,7 +35,7 @@ from html import escape
 
 from dotenv import load_dotenv
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter, TelegramUnauthorizedError
@@ -77,6 +79,7 @@ CREATOR_RAW = (os.getenv("CREATOR_ID") or "").strip()
 TEACHER_IDS = parse_ids(os.getenv("TEACHER_IDS", ""))
 SUPPORTER_IDS = parse_ids(os.getenv("SUPPORTER_IDS", ""))
 DB_PATH = os.getenv("DB_PATH", "academy.db")
+BUTTON_COLORS = os.getenv("BUTTON_COLORS", "1") != "0"  # set BUTTON_COLORS=0 to switch colored buttons off
 
 if not BOT_TOKEN or ":" not in BOT_TOKEN:
     sys.exit("ERROR: BOT_TOKEN is missing or invalid. Open the .env file and paste the token from @BotFather.")
@@ -94,6 +97,7 @@ STAFF = ("teacher", "supporter", "creator")
 TS = ("teacher", "supporter")
 ROLE_LABEL = {"creator": "Creator", "teacher": "Teacher", "supporter": "Supporter", "student": "Student"}
 
+MAX_CHANNELS = 5    # required channels for the mandatory subscription
 PAGE = 6            # items per page in lists
 PAGE_STUDENTS = 8   # students per page
 REVIEW_PAGE = 4     # questions per page in Review Answers
@@ -245,6 +249,14 @@ CREATE TABLE IF NOT EXISTS activity_logs (
     details    TEXT,
     created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS required_channels (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id    INTEGER NOT NULL,
+    title      TEXT,
+    username   TEXT,
+    invite_url TEXT,
+    added_at   TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_points_user_date ON points_history (user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_attempts_user    ON attempts (user_id);
 CREATE INDEX IF NOT EXISTS idx_answers_attempt  ON answers (attempt_id);
@@ -356,6 +368,12 @@ def get_role(tg_id: int):
         if user:
             return "blocked" if user["blocked"] else "student"
     return None
+
+
+def get_channels() -> list:
+    """Channels students must join (mandatory subscription). Empty list = the check is off."""
+    with db() as c:
+        return c.execute("SELECT * FROM required_channels ORDER BY id").fetchall()
 
 
 def get_user(tg_id: int):
@@ -898,10 +916,66 @@ def system_stats() -> dict:
 # UI helpers
 # ============================================================================
 
-def btn(text: str, data: str = None, url: str = None) -> InlineKeyboardButton:
-    if url:
-        return InlineKeyboardButton(text=text, url=url)
-    return InlineKeyboardButton(text=text, callback_data=data)
+# --- Button colors (Telegram: "success" = green, "danger" = red, "primary" = blue, none = standard) -------
+# The color is chosen in ONE place, by what the button does. Older Telegram apps simply show no color.
+AUTO = object()
+_STYLE_OK = [True]
+_SPECIAL_TEXT = {"📊 Results": "primary", "📋 Review Answers": "primary"}
+_STYLE_EXACT = {
+    "st:tests": "success", "st:profile": "primary", "st:rankings": "primary",
+    "an:group": "primary", "an:student": "primary",
+    "sec:block": "primary", "sec:code": "primary",
+    "bk:make": "success", "bk:restore": "primary", "bk:yes": "success", "bk:no": "danger",
+    "mr:adjust": "primary", "mr:reset": "danger", "mr:resetyes": "danger",
+    "ct:pub": "success", "an:pub": "success", "sub:check": "success",
+}
+_LIST_PREFIXES = ("tv:", "mtv:", "spk:", "tl:", "mt:", "tr:", "sp:", "ta:", "rv:", "trv:")  # lists, pages, answers
+_STYLE_WORDS = (
+    (("unblock", "reopen", "open registration", "publish", "start test", "resume test", "practice again",
+      "add teacher", "add supporter", "create backup", "add channel"), "success"),
+    (("delete", "remove", "reset", "finish", "close test", "close registration", "block student"), "danger"),
+    (("results", "adjust points"), "primary"),
+)
+_STYLE_PREFIX = (("panel:", "primary"), ("cr:", "primary"), ("bs:", "primary"), ("rk:", "primary"),
+                 ("sec:", "primary"), ("ts:", "success"), ("tf:", "danger"), ("tfy:", "danger"),
+                 ("usd:", "danger"), ("usx:", "danger"), ("mtd:", "danger"), ("mtx:", "danger"))
+
+
+def style_for(text: str, data: str = None):
+    """Green for the main and confirming actions, red for cancelling and deleting, blue for sections."""
+    if not BUTTON_COLORS or not data:
+        return None
+    if text in _SPECIAL_TEXT:
+        return _SPECIAL_TEXT[text]
+    lowered = text.lower()
+    if lowered.endswith("cancel"):
+        return "danger"
+    if data in _STYLE_EXACT:
+        return _STYLE_EXACT[data]
+    if data.startswith("lb:"):  # Today / Week / Overall: the open one is green
+        return "success" if text.startswith("✅") else None
+    if data.startswith(_LIST_PREFIXES) or "remove last" in lowered:
+        return None
+    for words, style in _STYLE_WORDS:
+        if any(word in lowered for word in words):
+            return style
+    for prefix, style in _STYLE_PREFIX:
+        if data.startswith(prefix):
+            return style
+    return None
+
+
+def btn(text: str, data: str = None, url: str = None, style=AUTO) -> InlineKeyboardButton:
+    if style is AUTO:
+        style = style_for(text, data)
+    fields = {"url": url} if url else {"callback_data": data}
+    if style and _STYLE_OK[0]:
+        try:
+            return InlineKeyboardButton(text=text, style=style, **fields)
+        except Exception:  # an aiogram version that does not know button styles: continue without colors
+            _STYLE_OK[0] = False
+            logging.warning("This aiogram version does not accept button styles: colored buttons are off.")
+    return InlineKeyboardButton(text=text, **fields)
 
 
 def kb(*rows) -> InlineKeyboardMarkup:
@@ -1035,6 +1109,10 @@ class CodeEdit(StatesGroup):
     value = State()
 
 
+class ChannelAdd(StatesGroup):
+    value = State()
+
+
 # ============================================================================
 # Filters and message helpers
 # ============================================================================
@@ -1101,6 +1179,229 @@ router.message.filter(F.chat.type == "private")
 
 group_router = Router()
 group_router.message.filter(F.chat.type.in_({"group", "supergroup"}))
+
+
+# ============================================================================
+# Mandatory subscription (students must join the required channels)
+# ============================================================================
+
+SUB_CACHE_SECONDS = 600           # a successful check is remembered for 10 minutes
+SUB_WARN_SECONDS = 6 * 3600       # the Creator is warned about a broken channel at most every 6 hours
+SUB_OK: dict = {}                 # user id -> time until which the last successful check counts
+SUB_WARNED: dict = {}             # channel chat id -> time of the last warning
+SUB_EXEMPT = ("ta:", "tf:", "tfy:", "tfn:", "sub:")  # test answers (a running test is never interrupted) + the check button
+JOINED_STATUSES = ("member", "administrator", "creator")
+
+
+def channel_url(channel) -> str:
+    return channel["invite_url"] or (f"https://t.me/{channel['username']}" if channel["username"] else "")
+
+
+def sub_text(missing: list) -> str:
+    plural = "s" if len(missing) > 1 else ""
+    return (f"🔒 <b>SUBSCRIPTION REQUIRED</b>\n{LINE}\n"
+            f"To use the bot, please join the channel{plural} below, then press <b>I have joined</b>.")
+
+
+def sub_markup(missing: list) -> InlineKeyboardMarkup:
+    rows = [[btn(f"📢 {clip(ch['title'], 30)}", url=channel_url(ch))] for ch in missing]
+    rows.append([btn("✅ I have joined", "sub:check")])
+    return kb(*rows)
+
+
+async def warn_broken_channel(bot: Bot, channel, error) -> None:
+    """The check failed (the bot is not an administrator any more, or the channel is gone):
+    students are NOT blocked, the Creator is told (not more often than every 6 hours)."""
+    if time.time() - SUB_WARNED.get(channel["chat_id"], 0) < SUB_WARN_SECONDS:
+        return
+    SUB_WARNED[channel["chat_id"]] = time.time()
+    logging.warning("Subscription check failed for %s: %s", channel["title"], error)
+    await notify_creator(bot, f"{title_block('⚠️ SUBSCRIPTION CHECK FAILED')}"
+                              f"<b>Channel:</b> {escape(channel['title'])}\n"
+                              "The bot cannot check this channel, so students are <b>not</b> blocked. "
+                              "Please make sure the bot is still an administrator of the channel.")
+
+
+async def missing_channels(bot: Bot, user_id: int, fresh: bool = False) -> list:
+    """The required channels this user has NOT joined (empty list = allowed)."""
+    channels = get_channels()
+    if not channels or (not fresh and SUB_OK.get(user_id, 0) > time.time()):
+        return []
+    missing = []
+    for channel in channels:
+        try:
+            member = await bot.get_chat_member(channel["chat_id"], user_id)
+        except TelegramAPIError as exc:
+            await warn_broken_channel(bot, channel, exc)
+            continue
+        status = str(getattr(member.status, "value", member.status))
+        if status in JOINED_STATUSES or (status == "restricted" and getattr(member, "is_member", False)):
+            continue
+        missing.append(channel)
+    if not missing:
+        SUB_OK[user_id] = time.time() + SUB_CACHE_SECONDS
+    return missing
+
+
+def gate_applies(event) -> bool:
+    """Only students (and new users who are about to register) are checked, only in private chats."""
+    user = getattr(event, "from_user", None)
+    if user is None or not get_channels():
+        return False
+    role = get_role(user.id)
+    if role not in ("student", None):
+        return False
+    if role is None and get_setting("registration_open", "1") != "1":
+        return False
+    if isinstance(event, CallbackQuery):
+        if (event.data or "").startswith(SUB_EXEMPT):
+            return False
+        chat = getattr(event.message, "chat", None)
+        return chat is None or chat.type == "private"
+    return getattr(getattr(event, "chat", None), "type", "private") == "private"
+
+
+class SubscriptionGate(BaseMiddleware):
+    """Runs before every handler: a student who has not joined the channels sees the join screen instead."""
+
+    async def __call__(self, handler, event, data):
+        if gate_applies(event):
+            bot = data.get("bot") or event.bot
+            missing = await missing_channels(bot, event.from_user.id)
+            if missing:
+                text, markup = sub_text(missing), sub_markup(missing)
+                if isinstance(event, CallbackQuery):
+                    await show(event, text, markup)
+                else:
+                    await event.answer(text, reply_markup=markup)
+                return None
+        return await handler(event, data)
+
+
+router.message.outer_middleware(SubscriptionGate())
+router.callback_query.outer_middleware(SubscriptionGate())
+
+
+@router.callback_query(F.data == "sub:check")
+async def cb_sub_check(call: CallbackQuery) -> None:
+    """The 'I have joined' button: check again right now (no cache)."""
+    if get_role(call.from_user.id) not in ("student", None):
+        await call.answer()
+        await show_home(call, ack=False)
+        return
+    missing = await missing_channels(call.bot, call.from_user.id, fresh=True)
+    if not missing:
+        await call.answer("✅ Thank you!")
+        await show_home(call, ack=False)
+        return
+    await call.answer("You have not joined yet. Please join the channel first.", show_alert=True)
+    await show(call, sub_text(missing), sub_markup(missing), ack=False)
+
+
+# --- Creator: manage the required channels (Security & Access -> Required Channels) -------------
+
+def channels_screen():
+    channels = get_channels()
+    lines = [title_block("📢 REQUIRED CHANNELS").rstrip(), "Students must join these channels to use the bot.", ""]
+    rows = []
+    if not channels:
+        lines.append("No channels yet: the subscription check is switched off.")
+    for ch in channels:
+        where = f"@{ch['username']}" if ch["username"] else "private channel"
+        lines.append(f"• {escape(ch['title'])} ({escape(where)})")
+        rows.append([btn(f"❌ Remove: {clip(ch['title'], 22)}", f"chan:rm:{ch['id']}")])
+    if len(channels) < MAX_CHANNELS:
+        rows.append([btn("➕ Add Channel", "chan:add")])
+    rows += [[btn("◀️ Back", "cr:security")], MAIN]
+    return "\n".join(lines), kb(*rows)
+
+
+@router.callback_query(F.data.in_({"sec:chan", "chan:menu"}), HasRole("creator"))
+async def cb_channels(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    text, markup = channels_screen()
+    await show(call, text, markup)
+
+
+@router.callback_query(F.data == "chan:add", HasRole("creator"))
+async def cb_channel_add(call: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(ChannelAdd.value)
+    text = (f"{title_block('➕ ADD CHANNEL')}"
+            "1. Add this bot to the channel as an <b>administrator</b>.\n"
+            "2. Send the channel <code>@username</code>, or forward any post from the channel here "
+            "(for a private channel).")
+    await show(call, text, kb([btn("↩️ Cancel", "chan:menu")]))
+
+
+@router.message(StateFilter(ChannelAdd.value), HasRole("creator"))
+async def channel_add_value(message: Message, state: FSMContext) -> None:
+    bot = message.bot
+    ref = None
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None and getattr(origin, "type", "") == "channel":
+        ref = origin.chat.id
+    elif getattr(message, "forward_from_chat", None) is not None:
+        ref = message.forward_from_chat.id
+    elif message.text:
+        found = re.fullmatch(r"(?:https?://)?(?:t\.me/)?@?([A-Za-z][A-Za-z0-9_]{4,31})", message.text.strip())
+        if found:
+            ref = "@" + found.group(1)
+    if ref is None:
+        await message.answer("⚠️ Please send the channel <code>@username</code>, or forward a post from the channel.")
+        return
+    try:
+        chat = await bot.get_chat(ref)
+    except TelegramAPIError:
+        await message.answer("⚠️ I could not find this channel. Check the username, and make sure the bot "
+                             "is an administrator of the channel.")
+        return
+    if chat.type not in ("channel", "supergroup"):
+        await message.answer("⚠️ Only channels and groups can be used here.")
+        return
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat.id, me.id)
+        is_admin = str(getattr(member.status, "value", member.status)) in ("administrator", "creator")
+    except TelegramAPIError:
+        is_admin = False
+    if not is_admin:
+        await message.answer("⚠️ The bot is not an administrator of this channel. Please add it as an "
+                             "administrator, then send the channel again.")
+        return
+    url = f"https://t.me/{chat.username}" if chat.username else getattr(chat, "invite_link", None)
+    if not url:
+        try:
+            url = (await bot.create_chat_invite_link(chat.id, name="English Academy")).invite_link
+        except TelegramAPIError:
+            await message.answer("⚠️ This channel is private and the bot cannot create an invite link. "
+                                 "Please give the bot the <b>Invite users via link</b> right and try again.")
+            return
+    channels = get_channels()
+    if len(channels) >= MAX_CHANNELS:
+        await message.answer(f"⚠️ You can add at most {MAX_CHANNELS} channels. Remove one first.")
+        return
+    if any(ch["chat_id"] == chat.id for ch in channels):
+        await message.answer("⚠️ This channel has already been added.")
+        return
+    with db() as c:
+        c.execute("INSERT INTO required_channels (chat_id, title, username, invite_url, added_at) "
+                  "VALUES (?, ?, ?, ?, ?)", (chat.id, chat.title or str(chat.id), chat.username, url, now()))
+    SUB_OK.clear()
+    await state.clear()
+    log_activity(message.from_user.id, "channel_added", str(chat.id))
+    await message.answer("✅ Channel added. Students must join it from now on.")
+    text, markup = channels_screen()
+    await message.answer(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("chan:rm:"), HasRole("creator"))
+async def cb_channel_remove(call: CallbackQuery) -> None:
+    with db() as c:
+        c.execute("DELETE FROM required_channels WHERE id = ?", (int(call.data.split(":")[2]),))
+    SUB_OK.clear()
+    log_activity(call.from_user.id, "channel_removed", call.data)
+    text, markup = channels_screen()
+    await show(call, text, markup)
 
 
 # ============================================================================
@@ -2597,10 +2898,12 @@ def security_screen():
     text = (f"{title_block('🔐 SECURITY & ACCESS')}"
             f"<b>Registration:</b> {'Open' if registration_open else 'Closed'}\n"
             f"<b>Access code:</b> {escape(code) if code else 'off'}\n"
+            f"<b>Required channels:</b> {len(get_channels()) or 'off'}\n"
             f"<b>Blocked students:</b> {blocked}")
     markup = kb(
         [btn("🔒 Close Registration" if registration_open else "🔓 Open Registration", "sec:reg")],
         [btn("🔑 Change Access Code", "sec:code")],
+        [btn("📢 Required Channels", "sec:chan")],
         [btn("🚫 Block / Unblock Student", "sec:block")],
         MAIN)
     return text, markup
@@ -2816,7 +3119,7 @@ def notify_screen():
     for key, label in NOTIFY_DEFS.items():
         on = get_setting(key) == "1"
         lines.append(f"{'🔔' if on else '🔕'} {label}: <b>{'On' if on else 'Off'}</b>")
-        rows.append([btn(f"{'🔔' if on else '🔕'} {label}", f"nt:{key}")])
+        rows.append([btn(f"{'🔔' if on else '🔕'} {label}", f"nt:{key}", style="success" if on else None)])
     lines += ["", "<i>Student alerts go to all registered students. The other alerts are sent to you.</i>"]
     return "\n".join(lines), kb(*rows, MAIN)
 
@@ -3286,7 +3589,7 @@ async def notify_new_test(bot: Bot, test_id: int, publisher_id: int) -> None:
             f"<b>Questions:</b> {count_questions(test_id)}\n"
             f"<b>Time limit:</b> {fmt_duration(test_seconds(test_id))}\n"
             f"<b>Available for:</b> {time_left(test['expires_at'])}")
-    markup = kb([btn("📝 Open Test", f"tv:{test_id}")])
+    markup = kb([btn("📝 Open Test", f"tv:{test_id}", style="success")])
     sent = 0
     for uid in ids:
         for attempt in range(2):
