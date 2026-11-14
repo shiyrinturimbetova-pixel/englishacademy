@@ -1185,12 +1185,11 @@ group_router.message.filter(F.chat.type.in_({"group", "supergroup"}))
 # Mandatory subscription (students must join the required channels)
 # ============================================================================
 
-SUB_CACHE_SECONDS = 600           # a successful check is remembered for 10 minutes
 SUB_WARN_SECONDS = 6 * 3600       # the Creator is warned about a broken channel at most every 6 hours
-SUB_OK: dict = {}                 # user id -> time until which the last successful check counts
 SUB_WARNED: dict = {}             # channel chat id -> time of the last warning
-SUB_EXEMPT = ("ta:", "tf:", "tfy:", "tfn:", "sub:")  # test answers (a running test is never interrupted) + the check button
+SUB_EXEMPT = ("sub:",)            # only the "I have joined" button: everything else is checked EVERY time
 JOINED_STATUSES = ("member", "administrator", "creator")
+REQUIRED_TYPES = ("channel", "supergroup", "group")
 
 
 def channel_url(channel) -> str:
@@ -1198,9 +1197,10 @@ def channel_url(channel) -> str:
 
 
 def sub_text(missing: list) -> str:
-    plural = "s" if len(missing) > 1 else ""
+    many = len(missing) > 1
     return (f"🔒 <b>SUBSCRIPTION REQUIRED</b>\n{LINE}\n"
-            f"To use the bot, please join the channel{plural} below, then press <b>I have joined</b>.")
+            f"To use the bot, please join the channel{'s or groups' if many else ' or group'} below, "
+            "then press <b>I have joined</b>.")
 
 
 def sub_markup(missing: list) -> InlineKeyboardMarkup:
@@ -1222,25 +1222,24 @@ async def warn_broken_channel(bot: Bot, channel, error) -> None:
                               "Please make sure the bot is still an administrator of the channel.")
 
 
-async def missing_channels(bot: Bot, user_id: int, fresh: bool = False) -> list:
-    """The required channels this user has NOT joined (empty list = allowed)."""
+async def missing_channels(bot: Bot, user_id: int) -> list:
+    """The required channels/groups this user is NOT in right now. Checked live every time
+    (nothing is remembered), so a student who leaves is asked to join again at once."""
     channels = get_channels()
-    if not channels or (not fresh and SUB_OK.get(user_id, 0) > time.time()):
+    if not channels:
         return []
-    missing = []
-    for channel in channels:
+
+    async def joined(channel):
         try:
             member = await bot.get_chat_member(channel["chat_id"], user_id)
         except TelegramAPIError as exc:
             await warn_broken_channel(bot, channel, exc)
-            continue
+            return True  # a broken channel must never lock everybody out
         status = str(getattr(member.status, "value", member.status))
-        if status in JOINED_STATUSES or (status == "restricted" and getattr(member, "is_member", False)):
-            continue
-        missing.append(channel)
-    if not missing:
-        SUB_OK[user_id] = time.time() + SUB_CACHE_SECONDS
-    return missing
+        return status in JOINED_STATUSES or (status == "restricted" and bool(getattr(member, "is_member", False)))
+
+    results = await asyncio.gather(*(joined(ch) for ch in channels))
+    return [ch for ch, ok in zip(channels, results) if not ok]
 
 
 def gate_applies(event) -> bool:
@@ -1284,12 +1283,12 @@ router.callback_query.outer_middleware(SubscriptionGate())
 
 @router.callback_query(F.data == "sub:check")
 async def cb_sub_check(call: CallbackQuery) -> None:
-    """The 'I have joined' button: check again right now (no cache)."""
+    """The 'I have joined' button: check again right now."""
     if get_role(call.from_user.id) not in ("student", None):
         await call.answer()
         await show_home(call, ack=False)
         return
-    missing = await missing_channels(call.bot, call.from_user.id, fresh=True)
+    missing = await missing_channels(call.bot, call.from_user.id)
     if not missing:
         await call.answer("✅ Thank you!")
         await show_home(call, ack=False)
@@ -1302,12 +1301,14 @@ async def cb_sub_check(call: CallbackQuery) -> None:
 
 def channels_screen():
     channels = get_channels()
-    lines = [title_block("📢 REQUIRED CHANNELS").rstrip(), "Students must join these channels to use the bot.", ""]
+    lines = [title_block("📢 REQUIRED CHANNELS").rstrip(),
+             "Students must be a member of all of these to use the bot. This is checked every time, "
+             "so a student who leaves is asked to join again at once.", ""]
     rows = []
     if not channels:
-        lines.append("No channels yet: the subscription check is switched off.")
+        lines.append("Nothing added yet: the subscription check is switched off.")
     for ch in channels:
-        where = f"@{ch['username']}" if ch["username"] else "private channel"
+        where = f"@{ch['username']}" if ch["username"] else "private"
         lines.append(f"• {escape(ch['title'])} ({escape(where)})")
         rows.append([btn(f"❌ Remove: {clip(ch['title'], 22)}", f"chan:rm:{ch['id']}")])
     if len(channels) < MAX_CHANNELS:
@@ -1326,38 +1327,23 @@ async def cb_channels(call: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "chan:add", HasRole("creator"))
 async def cb_channel_add(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(ChannelAdd.value)
-    text = (f"{title_block('➕ ADD CHANNEL')}"
-            "1. Add this bot to the channel as an <b>administrator</b>.\n"
-            "2. Send the channel <code>@username</code>, or forward any post from the channel here "
-            "(for a private channel).")
+    text = (f"{title_block('➕ ADD CHANNEL OR GROUP')}"
+            "1. Add this bot to the channel or group as an <b>administrator</b>.\n"
+            "2. Send its <code>@username</code>, or forward any post from the channel here "
+            "(private channel).\n"
+            "For a <b>group</b>, you can also send /require inside the group itself.")
     await show(call, text, kb([btn("↩️ Cancel", "chan:menu")]))
 
 
-@router.message(StateFilter(ChannelAdd.value), HasRole("creator"))
-async def channel_add_value(message: Message, state: FSMContext) -> None:
-    bot = message.bot
-    ref = None
-    origin = getattr(message, "forward_origin", None)
-    if origin is not None and getattr(origin, "type", "") == "channel":
-        ref = origin.chat.id
-    elif getattr(message, "forward_from_chat", None) is not None:
-        ref = message.forward_from_chat.id
-    elif message.text:
-        found = re.fullmatch(r"(?:https?://)?(?:t\.me/)?@?([A-Za-z][A-Za-z0-9_]{4,31})", message.text.strip())
-        if found:
-            ref = "@" + found.group(1)
-    if ref is None:
-        await message.answer("⚠️ Please send the channel <code>@username</code>, or forward a post from the channel.")
-        return
+async def register_required_chat(bot: Bot, ref, creator_id: int):
+    """Adds a channel or group to the required list. Returns an error text, or None when it was added."""
     try:
         chat = await bot.get_chat(ref)
     except TelegramAPIError:
-        await message.answer("⚠️ I could not find this channel. Check the username, and make sure the bot "
-                             "is an administrator of the channel.")
-        return
-    if chat.type not in ("channel", "supergroup"):
-        await message.answer("⚠️ Only channels and groups can be used here.")
-        return
+        return ("⚠️ I could not find this channel or group. Check the username, and make sure the bot "
+                "is an administrator there.")
+    if chat.type not in REQUIRED_TYPES:
+        return "⚠️ Only channels and groups can be used here."
     try:
         me = await bot.get_me()
         member = await bot.get_chat_member(chat.id, me.id)
@@ -1365,31 +1351,52 @@ async def channel_add_value(message: Message, state: FSMContext) -> None:
     except TelegramAPIError:
         is_admin = False
     if not is_admin:
-        await message.answer("⚠️ The bot is not an administrator of this channel. Please add it as an "
-                             "administrator, then send the channel again.")
-        return
+        return ("⚠️ The bot is not an administrator there. Please add it as an administrator, "
+                "then try again.")
     url = f"https://t.me/{chat.username}" if chat.username else getattr(chat, "invite_link", None)
     if not url:
         try:
             url = (await bot.create_chat_invite_link(chat.id, name="English Academy")).invite_link
         except TelegramAPIError:
-            await message.answer("⚠️ This channel is private and the bot cannot create an invite link. "
-                                 "Please give the bot the <b>Invite users via link</b> right and try again.")
-            return
+            return ("⚠️ This chat is private and the bot cannot create an invite link. "
+                    "Please give the bot the <b>Invite users via link</b> right and try again.")
     channels = get_channels()
     if len(channels) >= MAX_CHANNELS:
-        await message.answer(f"⚠️ You can add at most {MAX_CHANNELS} channels. Remove one first.")
-        return
+        return f"⚠️ You can add at most {MAX_CHANNELS} channels or groups. Remove one first."
     if any(ch["chat_id"] == chat.id for ch in channels):
-        await message.answer("⚠️ This channel has already been added.")
-        return
+        return "⚠️ This channel or group has already been added."
     with db() as c:
         c.execute("INSERT INTO required_channels (chat_id, title, username, invite_url, added_at) "
                   "VALUES (?, ?, ?, ?, ?)", (chat.id, chat.title or str(chat.id), chat.username, url, now()))
-    SUB_OK.clear()
+    log_activity(creator_id, "channel_added", str(chat.id))
+    return None
+
+
+@router.message(StateFilter(ChannelAdd.value), HasRole("creator"))
+async def channel_add_value(message: Message, state: FSMContext) -> None:
+    ref = None
+    origin = getattr(message, "forward_origin", None)
+    origin_type = getattr(origin, "type", "")
+    if origin_type == "channel":
+        ref = origin.chat.id
+    elif origin_type == "chat":
+        ref = origin.sender_chat.id
+    elif getattr(message, "forward_from_chat", None) is not None:
+        ref = message.forward_from_chat.id
+    elif message.text:
+        found = re.fullmatch(r"(?:https?://)?(?:t\.me/)?@?([A-Za-z][A-Za-z0-9_]{4,31})", message.text.strip())
+        if found:
+            ref = "@" + found.group(1)
+    if ref is None:
+        await message.answer("⚠️ Please send the <code>@username</code> of the channel or group, or forward a "
+                             "post from it. For a private group, send /require inside that group instead.")
+        return
+    error = await register_required_chat(message.bot, ref, message.from_user.id)
+    if error:
+        await message.answer(error)
+        return
     await state.clear()
-    log_activity(message.from_user.id, "channel_added", str(chat.id))
-    await message.answer("✅ Channel added. Students must join it from now on.")
+    await message.answer("✅ Added. Students must be a member of it from now on.")
     text, markup = channels_screen()
     await message.answer(text, reply_markup=markup)
 
@@ -1398,7 +1405,6 @@ async def channel_add_value(message: Message, state: FSMContext) -> None:
 async def cb_channel_remove(call: CallbackQuery) -> None:
     with db() as c:
         c.execute("DELETE FROM required_channels WHERE id = ?", (int(call.data.split(":")[2]),))
-    SUB_OK.clear()
     log_activity(call.from_user.id, "channel_removed", call.data)
     text, markup = channels_screen()
     await show(call, text, markup)
@@ -3314,6 +3320,16 @@ async def group_leaderboard(message: Message, kind: str) -> None:
     await send_leaderboard(message.bot, message.chat.id, kind)
 
 
+@group_router.message(Command("require"))
+async def g_require(message: Message) -> None:
+    """Creator only: students must be members of THIS group to use the bot (works for private groups too)."""
+    if not message.from_user or get_role(message.from_user.id) != "creator":
+        await message.reply("Access denied. Only the Creator can use this command.")
+        return
+    error = await register_required_chat(message.bot, message.chat.id, message.from_user.id)
+    await message.answer(error or "✅ This group is now required: students must be a member of it to use the bot.")
+
+
 @group_router.message(Command("rankings", "rank"))
 async def g_rankings(message: Message) -> None:
     await group_leaderboard(message, "overall")
@@ -3743,7 +3759,8 @@ async def main() -> None:
         [BotCommand(command="rankings", description="Leaderboard"),
          BotCommand(command="daily", description="Today's leaderboard"),
          BotCommand(command="weekly", description="Weekly leaderboard"),
-         BotCommand(command="setgroup", description="Connect this group (Creator only)")],
+         BotCommand(command="setgroup", description="Connect this group (Creator only)"),
+         BotCommand(command="require", description="Make this group required (Creator only)")],
         scope=BotCommandScopeAllGroupChats(),
     )
     await bot.delete_webhook(drop_pending_updates=False)
